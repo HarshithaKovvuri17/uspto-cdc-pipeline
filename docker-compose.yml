@@ -1,0 +1,142 @@
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    healthcheck:
+      test: ["CMD-SHELL", "echo ruok | nc -w 2 localhost 2181 | grep imok || /bin/bash -c 'echo ruok > /dev/tcp/localhost/2181'"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 15s
+      retries: 10
+      start_period: 60s
+
+  postgres-source:
+    image: postgres:15-alpine
+    container_name: postgres-source
+    command: postgres -c wal_level=logical -c max_wal_senders=4 -c max_replication_slots=4
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_SOURCE_DB:-postgres_source}
+    ports:
+      - "5431:5432"
+    volumes:
+      - ./init-db/init-source.sql:/docker-entrypoint-initdb.d/init-source.sql
+      - ./init-db/patents.csv:/docker-entrypoint-initdb.d/patents.csv
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_SOURCE_DB:-postgres_source}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  postgres-target:
+    image: postgres:15-alpine
+    container_name: postgres-target
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_TARGET_DB:-postgres_target}
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./init-db/init-target.sql:/docker-entrypoint-initdb.d/init-target.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_TARGET_DB:-postgres_target}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  kafka-connect:
+    image: debezium/connect:2.5
+    container_name: kafka-connect
+    ports:
+      - "8083:8083"
+    environment:
+      BOOTSTRAP_SERVERS: kafka:9092
+      GROUP_ID: "1"
+      CONFIG_STORAGE_TOPIC: "my_connect_configs"
+      OFFSET_STORAGE_TOPIC: "my_connect_offsets"
+      STATUS_STORAGE_TOPIC: "my_connect_statuses"
+      KEY_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      VALUE_CONVERTER: "org.apache.kafka.connect.json.JsonConverter"
+      CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      CONNECT_CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_STATUS_STORAGE_REPLICATION_FACTOR: "1"
+      CONNECT_REST_ADVERTISED_HOST_NAME: "kafka-connect"
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-source:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 15
+      start_period: 60s
+
+  connector-creator:
+    image: curlimages/curl:latest
+    container_name: connector-creator
+    depends_on:
+      kafka-connect:
+        condition: service_healthy
+    entrypoint: ["/bin/sh", "-c", "until curl -s -f http://kafka-connect:8083/connectors; do sleep 2; done && echo 'Registering connector...' && curl -s -X POST -H 'Content-Type: application/json' -d @/config/register-postgres-connector.json http://kafka-connect:8083/connectors && echo 'Done!'"]
+    volumes:
+      - ./config:/config
+
+  consumer-service:
+    build:
+      context: ./consumer
+      dockerfile: Dockerfile
+    container_name: consumer-service
+    restart: on-failure
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TOPIC: dbserver1.public.patent
+      POSTGRES_TARGET_HOST: postgres-target
+      POSTGRES_TARGET_PORT: 5432
+      POSTGRES_TARGET_DB: ${POSTGRES_TARGET_DB:-postgres_target}
+      POSTGRES_TARGET_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_TARGET_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres-target:
+        condition: service_healthy
+      kafka-connect:
+        condition: service_healthy
